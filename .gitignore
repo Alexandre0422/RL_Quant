@@ -1,0 +1,25 @@
+# Credentials
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# TRT engines (platform-specific, not portable)
+engines/*.trt
+engines/exhaustive_results.json
+
+# Results (generated outputs)
+results/checkpoints/
+results/figures/
+results/logs/
+
+# Temp files
+engines/_*.onnx
+engines/_*.trt
+
+# Archived TRT engines (platform-specific binaries, not portable)
+legacy_trt/engines/*.trt
+legacy_trt/engines/*.onnx
