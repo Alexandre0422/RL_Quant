@@ -119,11 +119,11 @@ QRT_BATCHES=1,256,4096 QRT_CFGS=D,E,F python qrt/bench/bench_roofline.py
 
 ## EXP-002 · TD-MPC2 roofline 镜像:在线规划批量端的 A8W8 ⏳ 待跑
 
-- **分支**:`houyishan/tdmpc2-quant`(off `roofline-crossover`,依赖 `wlinear.py`)
-- **代码**:[`qrt/tdmpc2/`](qrt/tdmpc2/)(world_model + quantize)、
-  [`qrt/bench/bench_tdmpc2.py`](qrt/bench/bench_tdmpc2.py)、
-  [`qrt/bench/_test_tdmpc2.py`](qrt/bench/_test_tdmpc2.py)
-- **日期**:2026-09-03 设计
+- **分支**:`houyishan/tdmpc2-quant`(off `roofline-crossover`)
+- **代码**:[`qrt/tdmpc2/integration.py`](qrt/tdmpc2/integration.py)(`accelerate_tdmpc2` 双网络 patch)、
+  [`qrt/tdmpc2/qnormed.py`](qrt/tdmpc2/qnormed.py)(`QuantNormedLinear`)、
+  [`qrt/bench/bench_tdmpc2.py`](qrt/bench/bench_tdmpc2.py)
+- **日期**:2026-09-03 设计(v2:按用户反馈改为双网络 patch + rollout-only,弃自写重实现)
 
 ### 假设
 EXP-001 只测到 GLAD 部署端(B=1),且发现 `_int_mm` 在 M≤16 不可执行——INT8 linear 的
@@ -132,57 +132,60 @@ roofline 收益预测(小 batch 翻正)在 GLAD 上**原语不可达**,只能走
 **TD-MPC2(model-based RL)是 GLAD 的 roofline 镜像**:推理即在线 MPPI 规划,世界模型
 rollout 天然跑在 batch = `num_samples + num_pi_trajs`(官方默认 512+24 = **536**),
 落在**计算/激活主导端**——正是 `_int_mm`/IMMA(QuantLinear W8A8)该赢、GLAD 单步永远
-够不到的区间。而 encoder 仍是 B=1(weight-only 端)。**一个真实 RL 系统内同时命中
-roofline 两端。**
+够不到的区间。补齐 EXP-001 缺的计算主导端。
 
 **待验证**:
-1. rollout 的 A8W8+LET 在 B≈536 是否净正(`ΔlinE−C < 0`)?GLAD 在 B=4096 是负项
-   (+0.10ms),TD-MPC2 的 512×512 深链(每步 18 次串行 GEMM)是否让固定量化开销摊薄、
-   翻回收益?
-2. TD-MPC2 独有的「batch 是超参」:扫 `num_samples ∈ {64…1024}`,`ΔlinE−C` 是否随规划
-   预算增大而更负(越计算主导 → INT8 越赚)?变号点 `num_samples*` = 量化 × 规划预算
-   联合 Pareto 的边界。
-3. encoder(B=1)WeightOnlyLinear W8A16/W4A16 是否如 EXP-001 预期兑现权重访存收益。
+1. rollout 的 W8A8 在 B≈536 是否净正(`ΔINT8 < 0`)?GLAD 在 B=4096 是负项(+0.10ms),
+   TD-MPC2 的 512×512 rollout 深链(每步 dynamics+reward,H×iterations 次串行)是否让固定
+   量化开销摊薄、翻回收益?
+2. TD-MPC2 独有的「batch 是超参」:扫 `num_samples ∈ {64…1024}`,`ΔINT8` 是否随规划预算
+   增大而更负?变号点 `num_samples*` = 量化 × 规划预算联合 Pareto 的边界。
 
-### 设计
-- **隔离带 GEMM 的计算单元**(`estimate_value` 的 batched rollout),不计整条 `plan()`
-  ——topk/softmax 更新是噪声(EXP-001 方法学教训:整模型计时信噪比不足)。
-- 逐档叠加(只在 estimate_value 上):
-  - A FP16 eager → C FP16 compile(max-autotune,图融合+CUDA Graph)→ E +QuantLinear(W8A8)+LET
-  - 边际 `ΔlinE−C = lat(E)−lat(C)`;< 0 = INT8 linear 净正。
-- 扫 `num_samples`(固定硬件,移动 rollout batch 在 roofline 上的位置,与 EXP-001 同科学控制)。
-- 内附一阶 roofline 解析预测(TD-MPC2 各 rollout GEMM 的 FP16 vs INT8 总时间)对照。
-- encoder B=1 另行单测(量级差两个数量级,混一起会被淹没)。
-- **严格复用主线**:LET=`calib.fit_let`,INT8 GEMM=`QuantLinear`,weight-only=`WeightOnlyLinear`;
-  本实验只加 TD-MPC2 特有的层枚举 + `plan()` 驱动的激活采集(无 GLAD 的 act_inference)。
+### 方法(严格按主线「双网络」形态,patch 真实 tdmpc2)
+**关键更正(用户两次反馈)**:方法是**双网络**(不是单模型双 forward),集成是 **patch**
+(不是重写网络)。
+- **双网络**(镜像 `qrt/integration.py`):master=`agent.model`(FP32,训练/PPO 不动)+
+  `deepcopy(master).half()`(FP16 推理副本,独立权重,冻结);rollout 世界模型量化只加在副本上。
+- **patch**:`accelerate_tdmpc2(agent)` 鸭子接口 hook `agent.act / agent.update`,不 import
+  tdmpc2、不改其文件。路由 = wrap `agent.act`,规划期间把 `agent.model` 临时指向副本
+  (TD-MPC2 的 act/_plan/_estimate_value 全 @no_grad 且都经 self.model 调世界模型 → rebind
+  即整条 rollout 走量化副本);`update()` 后 master→副本 cast copy + requantize(每 iter 同步)。
+- **只量化 rollout**(用户明确):`_dynamics/_reward/_pi`。它们是 `nn.Sequential(NormedLinear...)`
+  (NormedLinear = nn.Linear 子类 + ln + act);直接 swap 成 QuantLinear 会**丢 ln/act**,故写
+  `QuantNormedLinear(QuantLinear)`:量化 matmul(复用 _int_mm/LET),补回 dropout→ln→act。
+  末层 plain Linear 仍用原 `QuantLinear`。**严格复用主线**(QuantLinear/calib.fit_let)。
+- **未量化(TODO,已在代码/docstring 标注)**:encoder(B=1,非 rollout);`_Qs` 是 vmap
+  `Ensemble`(params 是 stacked TensorDict、非可 swap 的 nn.Linear),需自写 batched-int8 kernel。
+- 默认 `act_mode="dynamic_full"`(零校准,免真实 obs);传 `calib_obs` + `act_mode="dynamic"`
+  走真 LET(在未 swap 副本上 hook rollout 激活 → `calib.fit_let`)。
+- 度量:`bench_tdmpc2.py` 扫 num_samples,量 `agent.act` 单步规划延迟 baseline vs +INT8,
+  `ΔINT8 = lat(+INT8) − lat(baseline)`;变号点 num_samples*。
 
-### 命令(远程,空闲卡,长任务 tmux 后台)
+### 命令(远程 ps2,需先装 tdmpc2)
 ```bash
-# 先过接线对拍(秒级,eager;确认 INT8 生效 + 数值合理):
+# 装 tdmpc2 依赖(走代理别名):
+ssh yishan_3090-7897-proxy '~/.conda/envs/glad_quant/bin/pip install <tdmpc2 依赖>'
+# 跑 roofline 扫描(把 tdmpc2 仓库根加 PYTHONPATH;cfg 构造见 bench 的 build_agent 接线缝):
 ssh yishan_3090 'source /opt/anaconda3/etc/profile.d/conda.sh && conda activate glad_quant \
-  && cd ~/RL_Quant && CUDA_VISIBLE_DEVICES=<空闲卡> python qrt/bench/_test_tdmpc2.py'
-# roofline 全扫(每个 num_samples 各自冷编译,程较长 → tmux 后台):
-ssh yishan_3090 '... && CUDA_VISIBLE_DEVICES=<空闲卡> python qrt/bench/bench_tdmpc2.py'
-# 缩小扫描快速验证:
-QRT_SAMPLES=64,512 QRT_CFGS=C,E python qrt/bench/bench_tdmpc2.py
-# 量化生效核验:python qrt/bench/_check_int8.py 的思路(grep _int_mm kernel)
+  && cd ~/RL_Quant && PYTHONPATH=/path/to/tdmpc2/tdmpc2:$PYTHONPATH \
+  CUDA_VISIBLE_DEVICES=<空闲卡> python qrt/bench/bench_tdmpc2.py'
+QRT_SAMPLES=64,512 python qrt/bench/bench_tdmpc2.py   # 缩小扫描
 ```
 
-### 结果
-⏳ 待跑(需上 ps2 空闲卡)。
-
-### 结论
-⏳ 待跑。
+### 结果 / 结论
+⏳ 待跑(需 ps2 装 tdmpc2)。
 
 ### 风险 / 注意
-- **plan() 全图 compile 大概率失败**:topk/softmax 分布更新是数据依赖控制流;故只 compile
-  `estimate_value`(定形前馈),外层 MPPI 更新留 eager——已如此设计。
-- **QuantLinear 硬约束**:in_features%8==0 且 M>16。默认 `action_dim=24` → dynamics/reward/Q
-  首层 K=536(536%8==0 ✓);`num_samples≥64` → N≥88>16 ✓;π 轨迹用 num_pi_trajs=24>16 ✓。
-  改 action_dim 为非 8 倍数时首层自动跳过(quantize 已记录 skip 列表,不假装量化)。
-- **精度须看 return / elite 重合度,非 cosine**:规划是对含噪 return 的 top-k argmax,回归
-  误差小 ≠ 排序不变(对应 GLAD 的 reward A/B 担忧)。本 EXP 先测 latency + estimate_value
-  的 cosine 作接线/生效验证;规划质量 A/B 留 EXP-003。
-- **权重随机初始化**:world_model 结构忠实但非训练收敛权重;latency/生效研究足够,真实任务
-  精度须 load 官方 checkpoint(命名已对齐,见 world_model docstring)。
-- 本地无 GPU:代码仅 py_compile 通过;所有数值/latency 结论待远程复跑后回填本节。
+- **无法本地验证**:本 patch 不含 stand-in(用户要求「只留 patch」),且 tdmpc2 未装本地 →
+  仅 py_compile 过。所有行为/数值待 ps2 装 tdmpc2 后复跑;`build_agent()` 的 cfg 构造依安装布局
+  可能要微调。
+- **官方 compile 冲突**:若 `agent.cfg.compile=True`,其编译的 `_plan` 可能绕过 model rebind →
+  patch 已 warn,建议 `cfg.compile=False`(由本 patch 加速)。
+- **QuantLinear 硬约束**:in_features%8==0 且 M>16。rollout 首层 K=latent+action(+task),非 8
+  倍数则 `swap_rollout_int8` 自动跳过并记录(不假装量化);规划 batch≈536>16、pi-traj batch=24>16
+  均满足 M>16。
+- **_Qs / encoder 未量化** → 本轮 ΔINT8 只反映 rollout backbone(dynamics/reward/pi),不是全模型。
+- **精度须看 return / elite 重合度,非 cosine**:规划是对含噪 return 的 top-k argmax;规划质量
+  A/B 留 EXP-003(对应 GLAD reward A/B)。
+- **compile + CUDA Graph 未加**:本 patch 先只做双网络 + INT8 rollout;`_plan` 数据依赖控制流
+  (topk/softmax)使全图 compile 难,留作 orthogonal 后续(只 compile _estimate_value 定形前馈)。

@@ -1,19 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-qrt.tdmpc2 — 用 qrt 量化方法加速 TD-MPC2 世界模型(EXP-002:roofline 镜像)
+qrt.tdmpc2 — 用 qrt 双网络量化 patch 加速 TD-MPC2(EXP-002:roofline 镜像)
 ══════════════════════════════════════════════════════════════════════════════
-TD-MPC2 是 GLAD 在 roofline 上的镜像工作负载:
-  encoder    B=1   权重访存主导 → WeightOnlyLinear(W8A16/W4A16)  ← GLAD 部署端同款
-  rollout    B≈536 计算/激活主导 → QuantLinear(W8A8/IMMA)+ LET   ← GLAD 单步够不到的端
+patch 真实 `tdmpc2.TDMPC2`(不重写网络)。双网络形态:FP32 master(`agent.model`,训练
+不动)+ FP16 推理副本(rollout 世界模型量化)+ 每 iter 同步。只量化 rollout
+(_dynamics/_reward/_pi);encoder 与 vmap _Qs 未量化(TODO)。
 
-于是「INT8 价值由逐算子 roofline 位置 + 可用 kernel 原语决定」在两个真实 RL 系统上
-各证一端。用法见 qrt/bench/bench_tdmpc2.py。
+TD-MPC2 在线 MPPI 规划把 rollout 推到 batch≈536(计算/激活主导)——正是 _int_mm/IMMA
+该赢、GLAD 单步(B=1)够不到的 roofline 端;与 GLAD(B=1→weight-only)镜像互补。
+
+用法:
+    from qrt.tdmpc2 import accelerate_tdmpc2
+    acc = accelerate_tdmpc2(agent)      # 一行接入;acc.detach() 还原
+见 qrt/bench/bench_tdmpc2.py。
 """
-from .world_model import (TDMPC2Config, TDMPC2WorldModel, SimNorm,
-                          build_world_model)
-from .quantize import (quantize_rollout, quantize_encoder, refresh_rollout,
-                       rollout_linear_paths, encoder_linear_paths)
+from .integration import accelerate_tdmpc2, TDMPC2Accelerator
+from .qnormed import QuantNormedLinear, swap_rollout_int8
 
-__all__ = ["TDMPC2Config", "TDMPC2WorldModel", "SimNorm", "build_world_model",
-           "quantize_rollout", "quantize_encoder", "refresh_rollout",
-           "rollout_linear_paths", "encoder_linear_paths"]
+__all__ = ["accelerate_tdmpc2", "TDMPC2Accelerator",
+           "QuantNormedLinear", "swap_rollout_int8"]
