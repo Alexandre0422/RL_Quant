@@ -114,3 +114,75 @@ QRT_BATCHES=1,256,4096 QRT_CFGS=D,E,F python qrt/bench/bench_roofline.py
   现象本身硬件无关**(roofline 性质)。解析预测提供硬件无关的趋势锚。
 - 小 B 单步极快、launch/库开销占比高 → 已加大 n_repeat(B≤64 用 300);仍需空闲卡避免负载污染。
 - 量化「精度过好」是警报;变号若与直觉矛盾,先 `_check_int8.py` grep `_int_mm` 确认 INT8 真生效。
+
+---
+
+## EXP-002 · TD-MPC2 roofline 镜像:在线规划批量端的 A8W8 ⏳ 待跑
+
+- **分支**:`houyishan/tdmpc2-quant`(off `roofline-crossover`,依赖 `wlinear.py`)
+- **代码**:[`qrt/tdmpc2/`](qrt/tdmpc2/)(world_model + quantize)、
+  [`qrt/bench/bench_tdmpc2.py`](qrt/bench/bench_tdmpc2.py)、
+  [`qrt/bench/_test_tdmpc2.py`](qrt/bench/_test_tdmpc2.py)
+- **日期**:2026-09-03 设计
+
+### 假设
+EXP-001 只测到 GLAD 部署端(B=1),且发现 `_int_mm` 在 M≤16 不可执行——INT8 linear 的
+roofline 收益预测(小 batch 翻正)在 GLAD 上**原语不可达**,只能走 weight-only。
+
+**TD-MPC2(model-based RL)是 GLAD 的 roofline 镜像**:推理即在线 MPPI 规划,世界模型
+rollout 天然跑在 batch = `num_samples + num_pi_trajs`(官方默认 512+24 = **536**),
+落在**计算/激活主导端**——正是 `_int_mm`/IMMA(QuantLinear W8A8)该赢、GLAD 单步永远
+够不到的区间。而 encoder 仍是 B=1(weight-only 端)。**一个真实 RL 系统内同时命中
+roofline 两端。**
+
+**待验证**:
+1. rollout 的 A8W8+LET 在 B≈536 是否净正(`ΔlinE−C < 0`)?GLAD 在 B=4096 是负项
+   (+0.10ms),TD-MPC2 的 512×512 深链(每步 18 次串行 GEMM)是否让固定量化开销摊薄、
+   翻回收益?
+2. TD-MPC2 独有的「batch 是超参」:扫 `num_samples ∈ {64…1024}`,`ΔlinE−C` 是否随规划
+   预算增大而更负(越计算主导 → INT8 越赚)?变号点 `num_samples*` = 量化 × 规划预算
+   联合 Pareto 的边界。
+3. encoder(B=1)WeightOnlyLinear W8A16/W4A16 是否如 EXP-001 预期兑现权重访存收益。
+
+### 设计
+- **隔离带 GEMM 的计算单元**(`estimate_value` 的 batched rollout),不计整条 `plan()`
+  ——topk/softmax 更新是噪声(EXP-001 方法学教训:整模型计时信噪比不足)。
+- 逐档叠加(只在 estimate_value 上):
+  - A FP16 eager → C FP16 compile(max-autotune,图融合+CUDA Graph)→ E +QuantLinear(W8A8)+LET
+  - 边际 `ΔlinE−C = lat(E)−lat(C)`;< 0 = INT8 linear 净正。
+- 扫 `num_samples`(固定硬件,移动 rollout batch 在 roofline 上的位置,与 EXP-001 同科学控制)。
+- 内附一阶 roofline 解析预测(TD-MPC2 各 rollout GEMM 的 FP16 vs INT8 总时间)对照。
+- encoder B=1 另行单测(量级差两个数量级,混一起会被淹没)。
+- **严格复用主线**:LET=`calib.fit_let`,INT8 GEMM=`QuantLinear`,weight-only=`WeightOnlyLinear`;
+  本实验只加 TD-MPC2 特有的层枚举 + `plan()` 驱动的激活采集(无 GLAD 的 act_inference)。
+
+### 命令(远程,空闲卡,长任务 tmux 后台)
+```bash
+# 先过接线对拍(秒级,eager;确认 INT8 生效 + 数值合理):
+ssh yishan_3090 'source /opt/anaconda3/etc/profile.d/conda.sh && conda activate glad_quant \
+  && cd ~/RL_Quant && CUDA_VISIBLE_DEVICES=<空闲卡> python qrt/bench/_test_tdmpc2.py'
+# roofline 全扫(每个 num_samples 各自冷编译,程较长 → tmux 后台):
+ssh yishan_3090 '... && CUDA_VISIBLE_DEVICES=<空闲卡> python qrt/bench/bench_tdmpc2.py'
+# 缩小扫描快速验证:
+QRT_SAMPLES=64,512 QRT_CFGS=C,E python qrt/bench/bench_tdmpc2.py
+# 量化生效核验:python qrt/bench/_check_int8.py 的思路(grep _int_mm kernel)
+```
+
+### 结果
+⏳ 待跑(需上 ps2 空闲卡)。
+
+### 结论
+⏳ 待跑。
+
+### 风险 / 注意
+- **plan() 全图 compile 大概率失败**:topk/softmax 分布更新是数据依赖控制流;故只 compile
+  `estimate_value`(定形前馈),外层 MPPI 更新留 eager——已如此设计。
+- **QuantLinear 硬约束**:in_features%8==0 且 M>16。默认 `action_dim=24` → dynamics/reward/Q
+  首层 K=536(536%8==0 ✓);`num_samples≥64` → N≥88>16 ✓;π 轨迹用 num_pi_trajs=24>16 ✓。
+  改 action_dim 为非 8 倍数时首层自动跳过(quantize 已记录 skip 列表,不假装量化)。
+- **精度须看 return / elite 重合度,非 cosine**:规划是对含噪 return 的 top-k argmax,回归
+  误差小 ≠ 排序不变(对应 GLAD 的 reward A/B 担忧)。本 EXP 先测 latency + estimate_value
+  的 cosine 作接线/生效验证;规划质量 A/B 留 EXP-003。
+- **权重随机初始化**:world_model 结构忠实但非训练收敛权重;latency/生效研究足够,真实任务
+  精度须 load 官方 checkpoint(命名已对齐,见 world_model docstring)。
+- 本地无 GPU:代码仅 py_compile 通过;所有数值/latency 结论待远程复跑后回填本节。
