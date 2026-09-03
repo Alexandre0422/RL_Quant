@@ -8,8 +8,10 @@ baseline(FP16 rollout)vs +INT8 rollout,扫 num_samples(TD-MPC2 的 batch 是超�
 把 rollout 在 roofline 上从算力不足推到计算主导)。
 
 论点:GLAD 部署 B=1(EXP-001 → weight-only);TD-MPC2 在线 MPPI 规划把 rollout 推到
-batch=num_samples+num_pi_trajs(≈536,计算/激活主导)—— 正是 _int_mm/IMMA 该赢、GLAD
-单步够不到的 roofline 端。ΔINT8<0 = INT8 rollout linear 在该 batch 净正。
+batch=num_samples(官方默认 512,计算/激活主导)—— 正是 _int_mm/IMMA 该赢、GLAD 单步
+够不到的 roofline 端。ΔINT8<0 = INT8 rollout linear 在该 batch 净正。
+baseline 与 +INT8 都过 max-autotune compile(ΔINT8 是干净量化边际);ps2 首跑证明 eager
++dynamic_full 下 INT8 反慢 3×,故本 bench 默认走 dynamic + compile。
 
 前置(远程 ps2,需装 tdmpc2 及其依赖,走代理别名):
   ssh yishan_3090-7897-proxy '~/.conda/envs/glad_quant/bin/pip install <tdmpc2 依赖>'
@@ -92,13 +94,14 @@ def main():
     print(f"GPU: {torch.cuda.get_device_name(0)}  PyTorch: {torch.__version__}")
     print(f"task={cfg.task}  latent={cfg.latent_dim} mlp={cfg.mlp_dim} "
           f"num_pi_trajs={cfg.num_pi_trajs} horizon={cfg.horizon}")
-    print(f"扫描 num_samples: {SAMPLES}(→ rollout batch = num_samples+{cfg.num_pi_trajs})\n")
+    print(f"扫描 num_samples: {SAMPLES}(官方 _plan 的 rollout batch = num_samples;"
+          f"num_pi_trajs={cfg.num_pi_trajs} 是 warm-start 轨迹,不加进采样 batch)\n")
 
     obs = make_obs()
     results = {}
     for ns in SAMPLES:
         cfg.num_samples = ns
-        print(f"━━━ num_samples={ns}  (batch≈{ns+cfg.num_pi_trajs}) " + "━" * 40)
+        print(f"━━━ num_samples={ns}  (rollout batch={ns}) " + "━" * 40)
         # 干净对照:baseline 与 +INT8 都走**同一个 FP16 双网络副本**,只差 rollout 是否 INT8
         # (隔离 fp32→fp16 混淆;ΔINT8 = 纯 INT8 边际)。
         acc0 = accelerate_tdmpc2(agent, int8=False, verbose=False)   # 纯 FP16 副本
@@ -120,7 +123,7 @@ def main():
 
         d = lat_int8 - lat_base
         results[ns] = (lat_base, lat_int8, d, n_q, n_skip)
-        print(f"  baseline(FP16)     {lat_base:8.3f}ms")
+        print(f"  baseline(FP16+compile) {lat_base:8.3f}ms")
         print(f"  +INT8 rollout      {lat_int8:8.3f}ms   ΔINT8={d:+.3f}ms   "
               f"(量化 {n_q} 层, 跳过 {n_skip})\n")
 

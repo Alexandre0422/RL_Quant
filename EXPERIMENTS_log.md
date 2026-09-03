@@ -172,8 +172,38 @@ ssh yishan_3090 'source /opt/anaconda3/etc/profile.d/conda.sh && conda activate 
 QRT_SAMPLES=64,512 python qrt/bench/bench_tdmpc2.py   # 缩小扫描
 ```
 
-### 结果 / 结论
-⏳ 待跑(需 ps2 装 tdmpc2)。
+### 结果(2026-09-03 ps2 首跑,GPU2;完整报告见 papernote/REPORT_tdmpc2_3090.md)
+**v1 自包含版**(git 历史 7aa136c 抽取):FP16 基线全复现,compile 比 eager **3.5–8.4×**;
+接线对拍 rollout W8A8+LET CosSim=0.994663 ✓。
+
+**v2 真实 TD-MPC2 双网络 patch**:首跑成功,量化接线正确(CosSim fp16 vs int8 = **0.999694**,
+9 层量化生效),但 **INT8 rollout 全区间约 3× 慢、ΔINT8 恒定 +68~71ms、无 roofline 变号点**:
+
+| num_samples | baseline FP16 ms | +INT8 ms | ΔINT8 ms |
+|---|---|---|---|
+| 64 | 33.30 | 102.39 | +69.09 |
+| 512 | 31.84 | 102.00 | +70.16 |
+| 1024 | 31.95 | 103.06 | +71.11 |
+
+**根因(报告已定位)**:v2 的 INT8 是**纯 eager**(无 compile/CUDA Graph)+ `dynamic_full`
+**每 forward 图内重量化权重**(mean/std/round/clamp 未融合)——正是主线铁律「INT8 必须靠
+max-autotune 图融合才可能赢」的反面。且 encoder/vmap _Qs 未量化,INT8 边际被稀释。
+两个口径坑:官方 _plan 的 rollout batch = **num_samples**(非 +num_pi_trajs);dtype 首跑崩
+(fp16 副本 × 官方 fp32 规划张量),报告临时改了官方 _plan 两行。
+
+### v3 修复(2026-09-03,本次提交,⏳ 待 ps2 复跑)
+按报告结论改 patch,给 INT8 公平机会:
+1. 默认 `act_mode` 改 **`dynamic`**(权重 requantize_ 一次量化、仅激活 scale 图内现算),
+   弃 dynamic_full 的每-forward 重量化。
+2. 新增 `compile_rollout`(默认开):对 `_estimate_value` 上 `max-autotune`,**baseline 与
+   +INT8 都编译** → ΔINT8 是干净量化边际;fullgraph=False 让 vmap _Qs 图断回退 eager。
+3. **dtype cast 移入 patch**(`_wrap_infer_dtype`:infer 世界模型方法入口 cast 浮点张量→fp16),
+   官方 `_plan` 零修改 → 可回滚报告改的两行。
+4. bench batch 标签修正为 num_samples;baseline 标注 FP16+compile。
+
+### 结论
+⏳ v3 待 ps2 复跑。**当前可下的结论**:eager+dynamic_full 下 INT8 rollout 不划算(与主线
+一致);能否翻正取决于 compile 融合 quant/dequant epilogue —— 这是 v3 要回答的。
 
 ### 风险 / 注意
 - **无法本地验证**:本 patch 不含 stand-in(用户要求「只留 patch」),且 tdmpc2 未装本地 →
@@ -187,5 +217,9 @@ QRT_SAMPLES=64,512 python qrt/bench/bench_tdmpc2.py   # 缩小扫描
 - **_Qs / encoder 未量化** → 本轮 ΔINT8 只反映 rollout backbone(dynamics/reward/pi),不是全模型。
 - **精度须看 return / elite 重合度,非 cosine**:规划是对含噪 return 的 top-k argmax;规划质量
   A/B 留 EXP-003(对应 GLAD reward A/B)。
-- **compile + CUDA Graph 未加**:本 patch 先只做双网络 + INT8 rollout;`_plan` 数据依赖控制流
-  (topk/softmax)使全图 compile 难,留作 orthogonal 后续(只 compile _estimate_value 定形前馈)。
+- **compile 已加(v3)**:`compile_rollout` 对 `_estimate_value` 上 max-autotune;`_plan` 的
+  topk/softmax 数据依赖控制流留在外层 eager(不进 compile),故只 compile 定形前馈的
+  `_estimate_value`。CUDA Graph(manual capture)仍待后续。
+- **dtype**:v3 已在 patch 内 cast(不改官方文件);ps2 上报告临时改的官方 _plan 两行可回滚。
+- **_Qs vmap 与 compile**:fullgraph=False 下 vmap 段图断回退 eager;若 compile 在 vmap 处报错,
+  暂设 compile_rollout=False 或把 _Qs 排除出 _estimate_value 的编译范围(待 ps2 验证)。

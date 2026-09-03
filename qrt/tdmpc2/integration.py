@@ -45,8 +45,9 @@ from .qnormed import swap_rollout_int8
 class TDMPC2Accelerator:
     """持有 master / infer 双网络与 swap 结果;detach() 还原 agent(消融对照)。"""
 
-    def __init__(self, agent, act_mode: str = "dynamic_full",
+    def __init__(self, agent, act_mode: str = "dynamic",
                  roots=("_dynamics", "_reward", "_pi"), int8: bool = True,
+                 compile_rollout: bool = True, compile_mode: str = "max-autotune",
                  calib_obs=None, let_steps: int = 50, verbose: bool = True):
         self.agent = agent
         self.master = agent.model                      # FP32 master(不动)
@@ -62,10 +63,18 @@ class TDMPC2Accelerator:
         infer.eval()
         self.infer = infer
 
+        # ── 1b. dtype 边界 cast(patch 内解决,不改官方 _plan)────────────────
+        # 官方 _plan/_estimate_value 的规划张量(actions/pi_actions/obs)默认 fp32,而
+        # infer 是 fp16 → "Float and Half" 崩(ps2 首跑实测)。在 infer 的世界模型方法
+        # 入口把浮点张量 cast 到副本 dtype,官方文件零修改。
+        self._wrap_infer_dtype(infer)
+
         # ── 2. (可选)LET 校准:在未 swap 的 infer 上采集 rollout 激活 → fit_let ──
+        # 仅在需要时校准:static 必须(固定 s_z);dynamic 传了 calib_obs 才做 LET(学 α/β),
+        # 否则 dynamic 的 s_z 图内现算、无 α/β,零校准。
         let_plan = None
-        if int8 and act_mode in ("dynamic", "static"):
-            assert calib_obs is not None, f"act_mode={act_mode} 需 calib_obs(真实 obs 列表)"
+        if int8 and (act_mode == "static" or (act_mode == "dynamic" and calib_obs is not None)):
+            assert calib_obs is not None, f"act_mode={act_mode}+LET 需 calib_obs(真实 obs 列表)"
             let_plan = self._calibrate_let(infer, roots, calib_obs, let_steps, verbose)
 
         # ── 3. 量化 rollout(推理副本上;master 不动)。int8=False → 纯 FP16 双网络
@@ -75,6 +84,19 @@ class TDMPC2Accelerator:
                 infer, roots=roots, act_mode=act_mode, let_plan=let_plan, verbose=verbose)
         else:
             self.swapped, self.skipped = {}, []
+
+        # ── 3b. 编译 _estimate_value(定形前馈,无 topk 控制流)──────────────────
+        # 关键:INT8 的 quant/dequant epilogue 必须被 inductor 融进 _int_mm 才可能赢
+        # (主线铁律;ps2 首跑证明 eager INT8 反慢 3×)。对 baseline 与 +INT8 都编译 →
+        # ΔINT8 是干净的量化边际,不混入 compile 收益。fullgraph=False:允许 vmap 的
+        # _Qs 图断回退 eager(dynamics/reward 主体仍融合)。
+        self._orig_ev = None
+        if compile_rollout and hasattr(agent, "_estimate_value"):
+            import torch._dynamo as _dynamo
+            _dynamo.reset()
+            self._orig_ev = agent._estimate_value
+            agent._estimate_value = torch.compile(
+                agent._estimate_value, mode=compile_mode, fullgraph=False, dynamic=False)
 
         # ── 4. 路由:wrap agent.act —— 规划期间 agent.model 指向 infer ──────────
         self._orig_act = agent.act
@@ -104,8 +126,8 @@ class TDMPC2Accelerator:
         self.sync()                                    # 建 pair + 首次对齐(幂等)
         if verbose:
             print(f"[qrt-tdmpc2] 就绪:双网络 patch,act_mode={act_mode},"
-                  f"rollout 量化 {len(self.swapped)} 层(跳过 {len(self.skipped)});"
-                  f"encoder/_Qs 未量化(rollout-only + vmap TODO)。")
+                  f"compile={compile_rollout},rollout 量化 {len(self.swapped)} 层"
+                  f"(跳过 {len(self.skipped)});encoder/_Qs 未量化(rollout-only + vmap TODO)。")
 
     # ── 权重同步(替代 refit;每 iter)────────────────────────────────────────
     @torch.inference_mode()
@@ -125,6 +147,21 @@ class TDMPC2Accelerator:
             dst.copy_(s)                               # fp32→fp16 cast
         for q in self.swapped.values():
             q.requantize_()                            # dynamic_full 下为空操作(权重量化在前向图内)
+
+    # ── dtype 边界 cast(infer 世界模型方法入口把 fp32 浮点张量 → 副本 dtype)──────
+    def _wrap_infer_dtype(self, infer):
+        dt = next(infer.parameters()).dtype
+
+        def cast_wrap(fn):
+            def wrapped(*args, **kwargs):
+                args = tuple(a.to(dt) if torch.is_tensor(a) and a.is_floating_point()
+                             else a for a in args)
+                return fn(*args, **kwargs)
+            return wrapped
+        for name in ("encode", "next", "reward", "pi", "Q", "termination"):
+            fn = getattr(infer, name, None)
+            if callable(fn):
+                setattr(infer, name, cast_wrap(fn))
 
     # ── LET 校准(可选)────────────────────────────────────────────────────────
     @torch.no_grad()
@@ -171,15 +208,19 @@ class TDMPC2Accelerator:
         return plan
 
     def detach(self):
-        """还原 agent(移除 act/update 包装,回到原始路径;master 从未被改)。"""
+        """还原 agent(移除 act/update/_estimate_value 包装,回到原始路径;master 从未被改)。"""
         self.agent.act = self._orig_act
         self.agent.update = self._orig_update
+        if self._orig_ev is not None:
+            self.agent._estimate_value = self._orig_ev
 
 
 def accelerate_tdmpc2(agent, **kwargs) -> TDMPC2Accelerator:
     """一行接入入口(参数见 TDMPC2Accelerator)。返回值保留以便 detach/inspect。
 
-    默认 act_mode='dynamic_full'(零校准,免真实 obs);要真 LET 传
-    act_mode='dynamic', calib_obs=[obs, ...](真实 rollout obs)。
+    默认 act_mode='dynamic'(权重经 requantize_ 一次量化、激活 scale 图内现算,零校准且
+    比 dynamic_full 省——后者每 forward 重量化权重,ps2 首跑证明其 eager 下反慢 3×);
+    compile_rollout=True 对 _estimate_value 上 max-autotune(INT8 融合的前提)。
+    要真 LET:传 act_mode='dynamic', calib_obs=[obs, ...](真实 rollout obs)。
     """
     return TDMPC2Accelerator(agent, **kwargs)
